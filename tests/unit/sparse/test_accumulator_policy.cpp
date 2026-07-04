@@ -26,7 +26,7 @@ struct wide_acc { double v = 0.0; };
 
 } // namespace
 
-namespace mtl::sparse::factorization {
+namespace mtl::math {
 template <>
 struct accumulator_traits<wide_acc, float> {
     static void  clear(wide_acc& a)                       { a.v = 0.0; }

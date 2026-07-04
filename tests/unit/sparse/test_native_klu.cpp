@@ -33,11 +33,12 @@ namespace {
 struct wide_acc { double v = 0.0; };
 } // namespace
 
-namespace mtl::sparse::factorization {
+namespace mtl::math {
 template <>
 struct accumulator_traits<wide_acc, float> {
     static void  clear(wide_acc& a)                  { a.v = 0.0; }
     static void  assign(wide_acc& a, const float& x) { a.v = static_cast<double>(x); }
+    template <typename Result = float>
     static float value(const wide_acc& a)            { return static_cast<float>(a.v); }
     static void  add_product(wide_acc& a, const float& m, const float& x) {
         a.v += static_cast<double>(m) * static_cast<double>(x);
