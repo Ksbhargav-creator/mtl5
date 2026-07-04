@@ -16,9 +16,11 @@
 #include <cassert>
 #include <cstddef>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 #include <mtl/sparse/util/csc.hpp>
+#include <mtl/math/accumulator_traits.hpp>
 
 namespace mtl::sparse::factorization {
 
@@ -103,34 +105,62 @@ inline std::size_t reach(
 ///
 /// On entry, b contains the right-hand side. On exit, b contains the solution.
 /// Only the entries in the reach are touched.
-template <typename Value, typename SizeType>
+template <typename Value, typename SizeType, typename Accumulator = Value>
 void sparse_lower_solve(
     const util::csc_matrix<Value, SizeType>& L,
     std::vector<Value>& x,
     const std::vector<std::size_t>& xi,
     std::size_t top)
 {
+    using AT = math::accumulator_traits<Accumulator, Value>;
     SizeType n = L.ncols;
 
-    // Process columns in topological order
-    for (std::size_t idx = top; idx < n; ++idx) {
-        std::size_t j = xi[idx];
-        assert(j < n);
+    if constexpr (std::is_same_v<Accumulator, Value>) {
+        // Fast path for matching accumulator: solve in-place on x.
+        for (std::size_t idx = top; idx < n; ++idx) {
+            std::size_t j = xi[idx];
+            assert(j < n);
 
-        // Find diagonal entry (first entry in column j should be row j)
-        SizeType diag_pos = L.col_ptr[j];
-        assert(diag_pos < L.col_ptr[j + 1]);
-        assert(L.row_ind[diag_pos] == j);
+            SizeType diag_pos = L.col_ptr[j];
+            assert(diag_pos < L.col_ptr[j + 1]);
+            assert(L.row_ind[diag_pos] == j);
 
-        Value diag = L.values[diag_pos];
-        assert(diag != Value{0});
+            Value diag = L.values[diag_pos];
+            assert(diag != Value{0});
 
-        x[j] /= diag;
+            x[j] /= diag;
 
-        // Scatter: for each off-diagonal entry in column j
-        for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
-            SizeType i = L.row_ind[p];
-            x[i] -= L.values[p] * x[j];
+            for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
+                SizeType i = L.row_ind[p];
+                x[i] -= L.values[p] * x[j];
+            }
+        }
+    } else {
+        // Quire-ready path: accumulate in accumulator precision, round once.
+        std::vector<Accumulator> acc_x(n);
+        for (std::size_t idx = top; idx < n; ++idx) {
+            std::size_t j = xi[idx];
+            AT::assign(acc_x[j], x[j]);
+        }
+
+        for (std::size_t idx = top; idx < n; ++idx) {
+            std::size_t j = xi[idx];
+            assert(j < n);
+
+            SizeType diag_pos = L.col_ptr[j];
+            assert(diag_pos < L.col_ptr[j + 1]);
+            assert(L.row_ind[diag_pos] == j);
+
+            Value diag = L.values[diag_pos];
+            assert(diag != Value{0});
+
+            Value xj = AT::value(acc_x[j]) / diag;
+            x[j] = xj;
+
+            for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
+                SizeType i = L.row_ind[p];
+                AT::add_product(acc_x[i], -L.values[p], xj);
+            }
         }
     }
 }
@@ -138,66 +168,118 @@ void sparse_lower_solve(
 /// Dense lower triangular solve: solve Lx = b where L is in CSC format.
 /// b is overwritten with the solution x.
 /// This processes all columns (no reach computation needed for dense b).
-template <typename Value, typename SizeType>
+template <typename Value, typename SizeType, typename Accumulator = Value>
 void dense_lower_solve(
     const util::csc_matrix<Value, SizeType>& L,
     std::vector<Value>& x)
 {
+    using AT = math::accumulator_traits<Accumulator, Value>;
     SizeType n = L.ncols;
 
-    for (SizeType j = 0; j < n; ++j) {
-        SizeType diag_pos = L.col_ptr[j];
-        if (diag_pos >= L.col_ptr[j + 1]) continue;
+    if constexpr (std::is_same_v<Accumulator, Value>) {
+        // Fast path for matching accumulator: solve in-place on x.
+        for (SizeType j = 0; j < n; ++j) {
+            SizeType diag_pos = L.col_ptr[j];
+            if (diag_pos >= L.col_ptr[j + 1]) continue;
 
-        assert(L.row_ind[diag_pos] == j);
-        Value diag = L.values[diag_pos];
-        assert(diag != Value{0});
+            assert(L.row_ind[diag_pos] == j);
+            Value diag = L.values[diag_pos];
+            assert(diag != Value{0});
 
-        x[j] /= diag;
+            x[j] /= diag;
 
-        for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
-            SizeType i = L.row_ind[p];
-            x[i] -= L.values[p] * x[j];
+            for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
+                x[L.row_ind[p]] -= L.values[p] * x[j];
+            }
+        }
+    } else {
+        // Quire-ready path: accumulate in accumulator precision, round once.
+        std::vector<Accumulator> acc_x(n);
+        for (SizeType j = 0; j < n; ++j) {
+            AT::assign(acc_x[j], x[j]);
+        }
+
+        for (SizeType j = 0; j < n; ++j) {
+            SizeType diag_pos = L.col_ptr[j];
+            if (diag_pos >= L.col_ptr[j + 1]) continue;
+
+            assert(L.row_ind[diag_pos] == j);
+            Value diag = L.values[diag_pos];
+            assert(diag != Value{0});
+
+            Value xj = AT::value(acc_x[j]) / diag;
+            x[j] = xj;
+
+            for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
+                SizeType i = L.row_ind[p];
+                AT::add_product(acc_x[i], -L.values[p], xj);
+            }
         }
     }
 }
 
 /// Dense upper triangular solve: solve Ux = b where U is in CSC format.
 /// b is overwritten with the solution x.
-template <typename Value, typename SizeType>
+template <typename Value, typename SizeType, typename Accumulator = Value>
 void dense_upper_solve(
     const util::csc_matrix<Value, SizeType>& U,
     std::vector<Value>& x)
 {
+    using AT = math::accumulator_traits<Accumulator, Value>;
     SizeType n = U.ncols;
 
-    for (SizeType j = n; j > 0; --j) {
-        SizeType col = j - 1;
-        // Find diagonal (last entry in column col for upper triangular)
-        SizeType diag_pos = U.col_ptr[col + 1] - 1;
-        if (U.col_ptr[col] > diag_pos) continue;
+    if constexpr (std::is_same_v<Accumulator, Value>) {
+        // Fast path for matching accumulator: solve in-place on x.
+        for (SizeType j = n; j > 0; --j) {
+            SizeType col = j - 1;
+            SizeType diag_pos = U.col_ptr[col + 1] - 1;
+            if (U.col_ptr[col] > diag_pos) continue;
 
-        assert(U.row_ind[diag_pos] == col);
-        Value diag = U.values[diag_pos];
-        assert(diag != Value{0});
+            assert(U.row_ind[diag_pos] == col);
+            Value diag = U.values[diag_pos];
+            assert(diag != Value{0});
 
-        x[col] /= diag;
+            x[col] /= diag;
 
-        // Scatter: off-diagonal entries are above the diagonal
-        for (SizeType p = U.col_ptr[col]; p < diag_pos; ++p) {
-            SizeType i = U.row_ind[p];
-            x[i] -= U.values[p] * x[col];
+            for (SizeType p = U.col_ptr[col]; p < diag_pos; ++p) {
+                x[U.row_ind[p]] -= U.values[p] * x[col];
+            }
+        }
+    } else {
+        // Quire-ready path: accumulate in accumulator precision, round once.
+        std::vector<Accumulator> acc_x(n);
+        for (SizeType j = 0; j < n; ++j) {
+            AT::assign(acc_x[j], x[j]);
+        }
+
+        for (SizeType j = n; j > 0; --j) {
+            SizeType col = j - 1;
+            SizeType diag_pos = U.col_ptr[col + 1] - 1;
+            if (U.col_ptr[col] > diag_pos) continue;
+
+            assert(U.row_ind[diag_pos] == col);
+            Value diag = U.values[diag_pos];
+            assert(diag != Value{0});
+
+            Value xcol = AT::value(acc_x[col]) / diag;
+            x[col] = xcol;
+
+            for (SizeType p = U.col_ptr[col]; p < diag_pos; ++p) {
+                SizeType i = U.row_ind[p];
+                AT::add_product(acc_x[i], -U.values[p], xcol);
+            }
         }
     }
 }
 
 /// Dense lower triangular transpose solve: solve L^T x = b where L is in CSC.
 /// Processes columns in reverse order.
-template <typename Value, typename SizeType>
+template <typename Value, typename SizeType, typename Accumulator = Value>
 void dense_lower_transpose_solve(
     const util::csc_matrix<Value, SizeType>& L,
     std::vector<Value>& x)
 {
+    using AT = math::accumulator_traits<Accumulator, Value>;
     SizeType n = L.ncols;
 
     for (SizeType j = n; j > 0; --j) {
@@ -208,10 +290,13 @@ void dense_lower_transpose_solve(
         assert(L.row_ind[diag_pos] == col);
 
         // Gather: subtract contributions from off-diagonal entries
+        Accumulator acc;
+        AT::assign(acc, x[col]);
         for (SizeType p = diag_pos + 1; p < L.col_ptr[col + 1]; ++p) {
             SizeType i = L.row_ind[p];
-            x[col] -= L.values[p] * x[i];
+            AT::add_product(acc, -L.values[p], x[i]);
         }
+        x[col] = AT::value(acc);
 
         x[col] /= L.values[diag_pos];
     }
@@ -220,19 +305,40 @@ void dense_lower_transpose_solve(
 /// Dense unit lower triangular solve: solve Lx = b where L is unit lower
 /// triangular in CSC format (diagonal entries in L are ignored; assumed 1).
 /// b is overwritten with the solution x.
-template <typename Value, typename SizeType>
+template <typename Value, typename SizeType, typename Accumulator = Value>
 void dense_unit_lower_solve(
     const util::csc_matrix<Value, SizeType>& L,
     std::vector<Value>& x)
 {
+    using AT = math::accumulator_traits<Accumulator, Value>;
     SizeType n = L.ncols;
 
-    for (SizeType j = 0; j < n; ++j) {
-        // Skip diagonal entry (implicit 1), scatter off-diagonal entries
-        for (SizeType p = L.col_ptr[j]; p < L.col_ptr[j + 1]; ++p) {
-            SizeType i = L.row_ind[p];
-            if (i > j) {
-                x[i] -= L.values[p] * x[j];
+    if constexpr (std::is_same_v<Accumulator, Value>) {
+        // Fast path for matching accumulator: solve in-place on x.
+        for (SizeType j = 0; j < n; ++j) {
+            for (SizeType p = L.col_ptr[j]; p < L.col_ptr[j + 1]; ++p) {
+                SizeType i = L.row_ind[p];
+                if (i > j) {
+                    x[i] -= L.values[p] * x[j];
+                }
+            }
+        }
+    } else {
+        // Quire-ready path: accumulate in accumulator precision, round once.
+        std::vector<Accumulator> acc_x(n);
+        for (SizeType j = 0; j < n; ++j) {
+            AT::assign(acc_x[j], x[j]);
+        }
+
+        for (SizeType j = 0; j < n; ++j) {
+            Value xj = AT::value(acc_x[j]);
+            x[j] = xj;
+
+            for (SizeType p = L.col_ptr[j]; p < L.col_ptr[j + 1]; ++p) {
+                SizeType i = L.row_ind[p];
+                if (i > j) {
+                    AT::add_product(acc_x[i], -L.values[p], xj);
+                }
             }
         }
     }
@@ -241,22 +347,25 @@ void dense_unit_lower_solve(
 /// Dense unit lower triangular transpose solve: solve L^T x = b where L is
 /// unit lower triangular in CSC (diagonal entries ignored; assumed 1).
 /// Processes columns in reverse order. b is overwritten with x.
-template <typename Value, typename SizeType>
+template <typename Value, typename SizeType, typename Accumulator = Value>
 void dense_unit_lower_transpose_solve(
     const util::csc_matrix<Value, SizeType>& L,
     std::vector<Value>& x)
 {
+    using AT = math::accumulator_traits<Accumulator, Value>;
     SizeType n = L.ncols;
 
     for (SizeType j = n; j > 0; --j) {
         SizeType col = j - 1;
         // Gather: subtract contributions from off-diagonal entries below diagonal
+        Accumulator acc;
+        AT::assign(acc, x[col]);
         for (SizeType p = L.col_ptr[col]; p < L.col_ptr[col + 1]; ++p) {
             SizeType i = L.row_ind[p];
-            if (i > col) {
-                x[col] -= L.values[p] * x[i];
-            }
+            if (i > col)
+                AT::add_product(acc, -L.values[p], x[i]);
         }
+        x[col] = AT::value(acc);
         // No diagonal division (unit diagonal)
     }
 }

@@ -60,7 +60,7 @@ struct lu_symbolic {
 /// Result of numeric LU factorization.
 /// Contains L (unit lower triangular) and U (upper triangular) in CSC,
 /// plus the row and column permutations.
-template <typename Value>
+template <typename Value, typename Accumulator = Value>
 struct lu_numeric {
     util::csc_matrix<Value> L;           // unit lower triangular factor (CSC)
     util::csc_matrix<Value> U;           // upper triangular factor (CSC)
@@ -97,10 +97,10 @@ struct lu_numeric {
             w[i] = static_cast<Value>(b(row_perm[i]));
 
         // Step 2: Forward solve: L * z = w (L is unit lower triangular)
-        dense_lower_solve(L, w);
+        dense_lower_solve<Value, std::size_t, Accumulator>(L, w);
 
         // Step 3: Back solve: U * y = z
-        dense_upper_solve(U, w);
+        dense_upper_solve<Value, std::size_t, Accumulator>(U, w);
 
         // Step 4: Apply column permutation: x = Q * y
         // Q maps new col -> old col, so x[q[i]] = y[i]
@@ -193,7 +193,7 @@ struct accumulator_traits : mtl::math::accumulator_traits<Acc, Value> {};
 ///                  singular: nothing to perturb).
 template <typename Value, typename Parameters, typename Accumulator = Value>
     requires OrderedField<Value>
-lu_numeric<Value> sparse_lu_numeric(
+lu_numeric<Value, Accumulator> sparse_lu_numeric(
     const mat::compressed2D<Value, Parameters>& A,
     const lu_symbolic& sym,
     Value threshold = Value{1},
@@ -416,7 +416,7 @@ lu_numeric<Value> sparse_lu_numeric(
     for (size_type p = 0; p < Li.size(); ++p)
         Li[p] = pinv[Li[p]];
 
-    lu_numeric<Value> result;
+    lu_numeric<Value, Accumulator> result;
     result.symbolic = sym;
     result.num_perturbed = num_perturbed;
 
@@ -475,11 +475,11 @@ lu_numeric<Value> sparse_lu_numeric(
 ///
 /// \throws std::runtime_error if a reused pivot is numerically zero for the new
 ///         values (the prior pivot sequence is no longer valid).
-template <typename Value, typename Parameters>
+template <typename Value, typename Parameters, typename Accumulator = Value>
     requires OrderedField<Value>
-lu_numeric<Value> sparse_lu_refactor(
+lu_numeric<Value, Accumulator> sparse_lu_refactor(
     const mat::compressed2D<Value, Parameters>& A,
-    const lu_numeric<Value>& prev)
+    const lu_numeric<Value, Accumulator>& prev)
 {
     using size_type = std::size_t;
     size_type n = prev.symbolic.n;
@@ -491,19 +491,20 @@ lu_numeric<Value> sparse_lu_refactor(
     auto AQ = util::column_permute(A, prev.symbolic.col_perm);
     auto C  = util::crs_to_csc(AQ);
 
+    using AT = accumulator_traits<Accumulator, Value>;
     const auto& pinv = prev.row_pinv;    // original row -> pivot position (fixed)
-    lu_numeric<Value> result = prev;     // reuse pattern + perms + symbolic
+    lu_numeric<Value, Accumulator> result = prev;     // reuse pattern + perms + symbolic
     result.num_perturbed = 0;            // refactor recomputes values without perturbing (throws on zero pivot)
     auto& L = result.L;                  // overwrite values in place
     auto& U = result.U;
 
-    std::vector<Value> x(n, Value{0});
+    std::vector<Accumulator> x(n);
 
     for (size_type k = 0; k < n; ++k) {
         // Scatter column k of the (column-permuted) A into the pivot-space
         // workspace.
         for (size_type p = C.col_ptr[k]; p < C.col_ptr[k + 1]; ++p)
-            x[pinv[C.row_ind[p]]] = C.values[p];
+            AT::assign(x[pinv[C.row_ind[p]]], C.values[p]);
 
         // Left-looking updates from contributing columns j < k. U(:,k) is sorted
         // ascending with the diagonal (row k) last, so the strict-upper entries
@@ -511,14 +512,14 @@ lu_numeric<Value> sparse_lu_refactor(
         size_type ubeg = U.col_ptr[k], uend = U.col_ptr[k + 1];
         for (size_type p = ubeg; p + 1 < uend; ++p) {   // exclude diagonal (last)
             size_type j = U.row_ind[p];
-            Value xj = x[j];
+            Value xj = AT::value(x[j]);
             if (xj == Value{0}) continue;
             // L(:,j): diagonal (row j, value 1) is first -> skip it.
             for (size_type q = L.col_ptr[j] + 1; q < L.col_ptr[j + 1]; ++q)
-                x[L.row_ind[q]] -= L.values[q] * xj;
+                AT::add_product(x[L.row_ind[q]], -L.values[q], xj);
         }
 
-        Value pivot = x[k];
+        Value pivot = AT::value(x[k]);
         if (pivot == Value{0}) {
             throw std::runtime_error(
                 "sparse_lu_refactor: zero pivot at column " + std::to_string(k)
@@ -527,12 +528,12 @@ lu_numeric<Value> sparse_lu_refactor(
 
         // Write U(:,k) values (all rows <= k, including the diagonal = pivot).
         for (size_type p = ubeg; p < uend; ++p)
-            U.values[p] = x[U.row_ind[p]];
+            U.values[p] = AT::value(x[U.row_ind[p]]);
 
         // Write L(:,k): unit diagonal first, then x[row]/pivot below.
         for (size_type p = L.col_ptr[k]; p < L.col_ptr[k + 1]; ++p) {
             size_type r = L.row_ind[p];
-            L.values[p] = (r == k) ? Value{1} : x[r] / pivot;
+            L.values[p] = (r == k) ? Value{1} : AT::value(x[r]) / pivot;
         }
 
         // Clear the workspace. Clear the U/L pattern AND the scattered A column:
@@ -540,9 +541,9 @@ lu_numeric<Value> sparse_lu_refactor(
         // entry outside the prior pattern (a pattern mismatch) it is scattered
         // here yet never consumed by the replay -- clearing the scatter positions
         // too keeps such an entry from polluting later columns.
-        for (size_type p = ubeg; p < uend; ++p)               x[U.row_ind[p]] = Value{0};
-        for (size_type p = L.col_ptr[k]; p < L.col_ptr[k + 1]; ++p) x[L.row_ind[p]] = Value{0};
-        for (size_type p = C.col_ptr[k]; p < C.col_ptr[k + 1]; ++p) x[pinv[C.row_ind[p]]] = Value{0};
+        for (size_type p = ubeg; p < uend; ++p)               AT::clear(x[U.row_ind[p]]);
+        for (size_type p = L.col_ptr[k]; p < L.col_ptr[k + 1]; ++p) AT::clear(x[L.row_ind[p]]);
+        for (size_type p = C.col_ptr[k]; p < C.col_ptr[k + 1]; ++p) AT::clear(x[pinv[C.row_ind[p]]]);
     }
 
     return result;

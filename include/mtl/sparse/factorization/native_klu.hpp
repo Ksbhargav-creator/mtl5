@@ -45,12 +45,13 @@ namespace mtl::sparse::factorization {
 /// Numeric KLU factorization: BTF permutation, the permuted matrix B = P*A*Q
 /// (block upper triangular), the per-new-index block id, and a left-looking LU
 /// factorization of each diagonal block.
-template <typename Value>
+template <typename Value, typename Accumulator = Value>
 struct klu_numeric {
     ordering::btf_result          btf;            ///< row/col permutations + blocks
     mat::compressed2D<Value>      B;              ///< P*(R*A)*Q, block upper triangular
     std::vector<std::size_t>      block_of;       ///< new index -> block id
-    std::vector<lu_numeric<Value>> block_numeric; ///< LU of each diagonal block
+    std::vector<lu_numeric<Value,
+    Accumulator>>                 block_numeric; ///< LU of each diagonal block
     std::vector<Value>            row_scale;      ///< r[orig row]; empty = unscaled
                                                   ///< (factored R*A, so solve scales b)
     std::size_t                   num_perturbed = 0; ///< total perturbed pivots across blocks (0 = clean)
@@ -84,6 +85,7 @@ struct klu_numeric {
         const auto& rp  = B.ref_major();
         const auto& ci  = B.ref_minor();
         const auto& dat = B.ref_data();
+        using AT = accumulator_traits<Accumulator, Value>;
 
         // Back-substitution: last block first.
         for (std::size_t blk = nblocks(); blk-- > 0; ) {
@@ -93,16 +95,19 @@ struct klu_numeric {
 
             vec::dense_vector<Value> rhs(m), sol(m, Value{0});
             for (std::size_t i = r0; i < r1; ++i) {
-                Value val = y[i];
+                // Quire-ready coupling: accumulate all off-diagonal block contributions
+                // in Accumulator precision and round once when producing the RHS value.
+                Accumulator acc;
+                AT::assign(acc, y[i]);
                 for (std::size_t k = rp[i]; k < rp[i + 1]; ++k) {
                     const std::size_t j = ci[k];
                     if (block_of[j] > blk)          // coupling to a solved block
-                        val -= dat[k] * y[j];
+                        AT::add_product(acc, -dat[k], y[j]);
                     // block_of[j] == blk: part of the diagonal block (handled by
                     //   the block LU below). block_of[j] < blk: impossible for
                     //   block-upper-triangular B.
                 }
-                rhs(static_cast<int>(i - r0)) = val;
+                rhs(static_cast<int>(i - r0)) = AT::value(acc);
             }
 
             block_numeric[blk].solve(sol, rhs);
@@ -139,7 +144,7 @@ struct klu_numeric {
 ///                               pivot column is numerically zero).
 template <typename Value, typename Parameters, typename Accumulator = Value>
     requires OrderedField<Value>
-klu_numeric<Value> native_klu_factor(
+klu_numeric<Value, Accumulator> native_klu_factor(
     const mat::compressed2D<Value, Parameters>& A,
     Value threshold = Value{1},
     bool scale = true,
@@ -151,7 +156,7 @@ klu_numeric<Value> native_klu_factor(
     }
     const std::size_t n = A.num_rows();
 
-    klu_numeric<Value> result;
+    klu_numeric<Value, Accumulator> result;
     if (n == 0) {
         result.btf.blocks = {0};
         return result;
@@ -278,11 +283,11 @@ klu_numeric<Value> native_klu_factor(
 /// \throws std::invalid_argument if A's dimensions do not match `prev`.
 /// \throws std::runtime_error    if a reused pivot is numerically zero for the
 ///                               new values (prior pivot sequence invalid).
-template <typename Value, typename Parameters>
+template <typename Value, typename Parameters, typename Accumulator = Value>
     requires OrderedField<Value>
-klu_numeric<Value> native_klu_refactor(
+klu_numeric<Value, Accumulator> native_klu_refactor(
     const mat::compressed2D<Value, Parameters>& A,
-    const klu_numeric<Value>& prev)
+    const klu_numeric<Value, Accumulator>& prev)
 {
     using std::abs;
     const std::size_t n = prev.num_rows();
@@ -296,7 +301,7 @@ klu_numeric<Value> native_klu_refactor(
             "native_klu_refactor: prior factorization is internally inconsistent");
     }
 
-    klu_numeric<Value> result;
+    klu_numeric<Value, Accumulator> result;
     if (n == 0) { result.btf.blocks = {0}; return result; }
 
     // Reuse the symbolic structure from the prior factorization.
