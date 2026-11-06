@@ -39,6 +39,7 @@
 #include <mtl/sparse/ordering/amd.hpp>
 #include <mtl/sparse/ordering/dulmage_mendelsohn.hpp>
 #include <mtl/sparse/util/permutation.hpp>
+#include <mtl/sparse/instrumentation/kernel_stats.hpp>
 
 namespace mtl::sparse::factorization {
 
@@ -95,18 +96,27 @@ struct klu_numeric {
 
             vec::dense_vector<Value> rhs(m), sol(m, Value{0});
             for (std::size_t i = r0; i < r1; ++i) {
+
+                // Count the number of coupling updates contributing to rhs(i)
+                std::size_t accum_len = 0;
+
                 // Quire-ready coupling: accumulate all off-diagonal block contributions
                 // in Accumulator precision and round once when producing the RHS value.
                 Accumulator acc;
                 AT::assign(acc, y[i]);
                 for (std::size_t k = rp[i]; k < rp[i + 1]; ++k) {
                     const std::size_t j = ci[k];
-                    if (block_of[j] > blk)          // coupling to a solved block
+                    if (block_of[j] > blk){         // coupling to a solved block
                         AT::add_product(acc, -dat[k], y[j]);
+                        accum_len++;
+                    }
                     // block_of[j] == blk: part of the diagonal block (handled by
                     //   the block LU below). block_of[j] < blk: impossible for
                     //   block-upper-triangular B.
                 }
+
+                instrumentation::schur_stats.record(accum_len);
+
                 rhs(static_cast<int>(i - r0)) = AT::value(acc);
             }
 

@@ -39,7 +39,18 @@ namespace mtl::sparse {
 /// Controls for iterative_refine.
 struct refine_options {
     int    max_iter = 20;     ///< maximum correction steps
-    double rel_tol  = 0.0;    ///< stop when ||r||inf/||b||inf <= rel_tol (0 = disabled)
+    /// Stop when ||r_i||_inf <= rel_tol * (||A||_inf*||x_i||_inf + ||b||_inf)
+    /// (0 = disabled). This is Criterion 1 of Demmel, Higham & Solomonik (LAPACK
+    /// Working Note 165, p.54), the same normwise backward-error bound used as
+    /// the convergence test in Quinlan & Omtzigt, "Iterative Refinement with
+    /// Low-Precision Posits" (Algorithm 2, line 5). A flat ||r||/||b|| <= tol
+    /// check is scale-blind: on a system where a transient residual dip crosses
+    /// a fixed fraction of ||b|| before the iterate has actually converged, it
+    /// declares victory early at whatever forward error that iterate happens to
+    /// have. Scaling by ||A||_inf*||x_i||_inf as well ties the threshold to the
+    /// actual magnitude of the arithmetic being done, so "converged" tracks the
+    /// residual's roundoff floor rather than an arbitrary fraction of ||b||.
+    double rel_tol  = 0.0;
     bool   scaled   = false;  ///< normalize the residual before each correction solve
     int    patience = 3;      ///< stop after this many consecutive non-improving steps
                               ///< (>=1; tolerates a noisy low-precision residual so IR
@@ -88,6 +99,16 @@ refine_result iterative_refine(
     };
     const double bnorm = norm_inf(b);
 
+    // ||A||_inf = max row sum of |A(i,j)|, from the CSR storage already in hand
+    // (O(nnz), not a dense O(n^2) scan) -- used by the convergence test below.
+    double Ainf = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        double row_sum = 0.0;
+        for (std::size_t k = rp[i]; k < rp[i + 1]; ++k)
+            row_sum += static_cast<double>(abs(dat[k]));
+        Ainf = std::max(Ainf, row_sum);
+    }
+
     vec::dense_vector<Residual> r(n), dx(n, Residual{0});
     vec::dense_vector<Residual> best_x = x;
     double best_rn = std::numeric_limits<double>::infinity();
@@ -110,8 +131,12 @@ refine_result iterative_refine(
         if (rn < best_rn) { best_rn = rn; best_x = x; stalls = 0; }
         else              { ++stalls; }
 
-        double rel = (bnorm > 0.0) ? rn / bnorm : rn;
-        if (opt.rel_tol > 0.0 && rel <= opt.rel_tol) { res.converged = true; break; }
+        // ||r_i|| <= rel_tol * (||A||_inf*||x_i||_inf + ||b||_inf) -- see the
+        // refine_options::rel_tol doc comment for why this replaces a flat
+        // ||r||/||b|| check.
+        const double xn = norm_inf(x);
+        const double bound = Ainf * xn + bnorm;
+        if (opt.rel_tol > 0.0 && rn <= opt.rel_tol * bound) { res.converged = true; break; }
         if (stalls >= patience) break;       // plateaued / diverging
 
         // Correction solve through the factorization (in its own precision).

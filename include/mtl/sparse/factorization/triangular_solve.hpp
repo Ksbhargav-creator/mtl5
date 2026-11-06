@@ -21,6 +21,7 @@
 
 #include <mtl/sparse/util/csc.hpp>
 #include <mtl/math/accumulator_traits.hpp>
+#include <mtl/sparse/instrumentation/kernel_stats.hpp>
 
 namespace mtl::sparse::factorization {
 
@@ -117,6 +118,7 @@ void sparse_lower_solve(
 
     if constexpr (std::is_same_v<Accumulator, Value>) {
         // Fast path for matching accumulator: solve in-place on x.
+        std::vector<std::size_t> accum_len(n, 0);
         for (std::size_t idx = top; idx < n; ++idx) {
             std::size_t j = xi[idx];
             assert(j < n);
@@ -129,10 +131,12 @@ void sparse_lower_solve(
             assert(diag != Value{0});
 
             x[j] /= diag;
+            instrumentation::forward_stats.record(accum_len[j]);
 
             for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
                 SizeType i = L.row_ind[p];
                 x[i] -= L.values[p] * x[j];
+                accum_len[i]++;
             }
         }
     } else {
@@ -143,6 +147,7 @@ void sparse_lower_solve(
             AT::assign(acc_x[j], x[j]);
         }
 
+        std::vector<std::size_t> accum_len(n, 0);
         for (std::size_t idx = top; idx < n; ++idx) {
             std::size_t j = xi[idx];
             assert(j < n);
@@ -156,10 +161,12 @@ void sparse_lower_solve(
 
             Value xj = AT::value(acc_x[j]) / diag;
             x[j] = xj;
+            instrumentation::forward_stats.record(accum_len[j]);
 
             for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
                 SizeType i = L.row_ind[p];
                 AT::add_product(acc_x[i], -L.values[p], xj);
+                accum_len[i]++;
             }
         }
     }
@@ -178,6 +185,7 @@ void dense_lower_solve(
 
     if constexpr (std::is_same_v<Accumulator, Value>) {
         // Fast path for matching accumulator: solve in-place on x.
+        std::vector<std::size_t> accum_len(n, 0);
         for (SizeType j = 0; j < n; ++j) {
             SizeType diag_pos = L.col_ptr[j];
             if (diag_pos >= L.col_ptr[j + 1]) continue;
@@ -187,9 +195,11 @@ void dense_lower_solve(
             assert(diag != Value{0});
 
             x[j] /= diag;
+            instrumentation::forward_stats.record(accum_len[j]);
 
             for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
                 x[L.row_ind[p]] -= L.values[p] * x[j];
+                accum_len[L.row_ind[p]]++;
             }
         }
     } else {
@@ -199,6 +209,7 @@ void dense_lower_solve(
             AT::assign(acc_x[j], x[j]);
         }
 
+        std::vector<std::size_t> accum_len(n, 0);
         for (SizeType j = 0; j < n; ++j) {
             SizeType diag_pos = L.col_ptr[j];
             if (diag_pos >= L.col_ptr[j + 1]) continue;
@@ -209,10 +220,12 @@ void dense_lower_solve(
 
             Value xj = AT::value(acc_x[j]) / diag;
             x[j] = xj;
+            instrumentation::forward_stats.record(accum_len[j]);
 
             for (SizeType p = diag_pos + 1; p < L.col_ptr[j + 1]; ++p) {
                 SizeType i = L.row_ind[p];
                 AT::add_product(acc_x[i], -L.values[p], xj);
+                accum_len[i]++;
             }
         }
     }
@@ -230,6 +243,7 @@ void dense_upper_solve(
 
     if constexpr (std::is_same_v<Accumulator, Value>) {
         // Fast path for matching accumulator: solve in-place on x.
+        std::vector<std::size_t> accum_len(n, 0);
         for (SizeType j = n; j > 0; --j) {
             SizeType col = j - 1;
             SizeType diag_pos = U.col_ptr[col + 1] - 1;
@@ -240,9 +254,11 @@ void dense_upper_solve(
             assert(diag != Value{0});
 
             x[col] /= diag;
+            instrumentation::backward_stats.record(accum_len[col]);
 
             for (SizeType p = U.col_ptr[col]; p < diag_pos; ++p) {
                 x[U.row_ind[p]] -= U.values[p] * x[col];
+                accum_len[U.row_ind[p]]++;
             }
         }
     } else {
@@ -252,6 +268,7 @@ void dense_upper_solve(
             AT::assign(acc_x[j], x[j]);
         }
 
+        std::vector<std::size_t> accum_len(n, 0);
         for (SizeType j = n; j > 0; --j) {
             SizeType col = j - 1;
             SizeType diag_pos = U.col_ptr[col + 1] - 1;
@@ -263,10 +280,12 @@ void dense_upper_solve(
 
             Value xcol = AT::value(acc_x[col]) / diag;
             x[col] = xcol;
+            instrumentation::backward_stats.record(accum_len[col]);
 
             for (SizeType p = U.col_ptr[col]; p < diag_pos; ++p) {
                 SizeType i = U.row_ind[p];
                 AT::add_product(acc_x[i], -U.values[p], xcol);
+                accum_len[i]++;
             }
         }
     }
@@ -292,11 +311,14 @@ void dense_lower_transpose_solve(
         // Gather: subtract contributions from off-diagonal entries
         Accumulator acc;
         AT::assign(acc, x[col]);
+        std::size_t accum_len = 0;
         for (SizeType p = diag_pos + 1; p < L.col_ptr[col + 1]; ++p) {
             SizeType i = L.row_ind[p];
             AT::add_product(acc, -L.values[p], x[i]);
+            accum_len++;
         }
         x[col] = AT::value(acc);
+        instrumentation::backward_stats.record(accum_len);
 
         x[col] /= L.values[diag_pos];
     }
@@ -315,11 +337,14 @@ void dense_unit_lower_solve(
 
     if constexpr (std::is_same_v<Accumulator, Value>) {
         // Fast path for matching accumulator: solve in-place on x.
+        std::vector<std::size_t> accum_len(n, 0);
         for (SizeType j = 0; j < n; ++j) {
+            instrumentation::forward_stats.record(accum_len[j]);
             for (SizeType p = L.col_ptr[j]; p < L.col_ptr[j + 1]; ++p) {
                 SizeType i = L.row_ind[p];
                 if (i > j) {
                     x[i] -= L.values[p] * x[j];
+                    accum_len[i]++;
                 }
             }
         }
@@ -330,14 +355,17 @@ void dense_unit_lower_solve(
             AT::assign(acc_x[j], x[j]);
         }
 
+        std::vector<std::size_t> accum_len(n, 0);
         for (SizeType j = 0; j < n; ++j) {
             Value xj = AT::value(acc_x[j]);
             x[j] = xj;
+            instrumentation::forward_stats.record(accum_len[j]);
 
             for (SizeType p = L.col_ptr[j]; p < L.col_ptr[j + 1]; ++p) {
                 SizeType i = L.row_ind[p];
                 if (i > j) {
                     AT::add_product(acc_x[i], -L.values[p], xj);
+                    accum_len[i]++;
                 }
             }
         }
@@ -360,12 +388,16 @@ void dense_unit_lower_transpose_solve(
         // Gather: subtract contributions from off-diagonal entries below diagonal
         Accumulator acc;
         AT::assign(acc, x[col]);
+        std::size_t accum_len = 0;
         for (SizeType p = L.col_ptr[col]; p < L.col_ptr[col + 1]; ++p) {
             SizeType i = L.row_ind[p];
-            if (i > col)
+            if (i > col) {
                 AT::add_product(acc, -L.values[p], x[i]);
+                accum_len++;
+            }
         }
         x[col] = AT::value(acc);
+        instrumentation::backward_stats.record(accum_len);
         // No diagonal division (unit diagonal)
     }
 }

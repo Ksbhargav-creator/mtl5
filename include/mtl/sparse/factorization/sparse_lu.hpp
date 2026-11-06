@@ -44,6 +44,7 @@
 #include <mtl/sparse/util/csc.hpp>
 #include <mtl/sparse/util/permutation.hpp>
 #include <mtl/sparse/factorization/triangular_solve.hpp>
+#include <mtl/sparse/instrumentation/kernel_stats.hpp>
 
 namespace mtl::sparse::factorization {
 
@@ -303,16 +304,20 @@ lu_numeric<Value, Accumulator> sparse_lu_numeric(
         for (size_type p = C.col_ptr[k]; p < C.col_ptr[k + 1]; ++p)
             AT::assign(x[C.row_ind[p]], C.values[p]);
 
+        std::vector<std::size_t> accum_len(n, 0);
         for (size_type px = top; px < n; ++px) {
             std::ptrdiff_t j = xi[px];
             std::ptrdiff_t jcol = pinv[j];
             if (jcol < 0) continue;                        // column not yet formed
             Value xj = AT::value(x[j]);                    // round U(j,k) once (single rounding)
+            instrumentation::schur_stats.record(accum_len[j]);
             // L(j,j) == 1 (unit lower, stored first) -> no divide needed. The
             // elimination subtraction x[i] -= L(i,j)*xj is an accumulate of the
             // negated product (negating a Value is exact).
-            for (size_type p = Lp[jcol] + 1; p < Lp[jcol + 1]; ++p)
+            for (size_type p = Lp[jcol] + 1; p < Lp[jcol + 1]; ++p) {
                 AT::add_product(x[Li[p]], -Lx[p], xj);
+                accum_len[Li[p]]++;
+            }
         }
 
         // --- threshold partial pivoting + emit U(:,k) for already-pivotal rows ---
@@ -375,6 +380,7 @@ lu_numeric<Value, Accumulator> sparse_lu_numeric(
             if (pinv[i] < 0) {                             // remaining -> L(i,k)
                 Li.push_back(i);
                 Lx.push_back(AT::value(x[i]) / pivot);
+                instrumentation::schur_stats.record(accum_len[i]);
             }
             AT::clear(x[i]);                               // clear workspace (reach only)
         }
@@ -509,17 +515,22 @@ lu_numeric<Value, Accumulator> sparse_lu_refactor(
         // Left-looking updates from contributing columns j < k. U(:,k) is sorted
         // ascending with the diagonal (row k) last, so the strict-upper entries
         // are exactly the contributing columns in topological order.
+        std::vector<std::size_t> accum_len(n, 0);
         size_type ubeg = U.col_ptr[k], uend = U.col_ptr[k + 1];
         for (size_type p = ubeg; p + 1 < uend; ++p) {   // exclude diagonal (last)
             size_type j = U.row_ind[p];
             Value xj = AT::value(x[j]);
+            instrumentation::schur_stats.record(accum_len[j]);
             if (xj == Value{0}) continue;
             // L(:,j): diagonal (row j, value 1) is first -> skip it.
-            for (size_type q = L.col_ptr[j] + 1; q < L.col_ptr[j + 1]; ++q)
+            for (size_type q = L.col_ptr[j] + 1; q < L.col_ptr[j + 1]; ++q) {
                 AT::add_product(x[L.row_ind[q]], -L.values[q], xj);
+                accum_len[L.row_ind[q]]++;
+            }
         }
 
         Value pivot = AT::value(x[k]);
+        instrumentation::schur_stats.record(accum_len[k]);
         if (pivot == Value{0}) {
             throw std::runtime_error(
                 "sparse_lu_refactor: zero pivot at column " + std::to_string(k)
@@ -534,6 +545,9 @@ lu_numeric<Value, Accumulator> sparse_lu_refactor(
         for (size_type p = L.col_ptr[k]; p < L.col_ptr[k + 1]; ++p) {
             size_type r = L.row_ind[p];
             L.values[p] = (r == k) ? Value{1} : AT::value(x[r]) / pivot;
+            if (r != k) {
+                instrumentation::schur_stats.record(accum_len[r]);
+            }
         }
 
         // Clear the workspace. Clear the U/L pattern AND the scattered A column:
